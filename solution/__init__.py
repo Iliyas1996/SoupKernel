@@ -8,14 +8,18 @@ that run our own Triton kernels:
 - solution/rmsnorm.py:     fused RMSNorm forward/backward for every Qwen2RMSNorm, and a fused
                            "residual add + RMSNorm" after each attention block;
 - solution/rope.py:        fused rotary position embedding for the queries and keys;
-- solution/swiglu.py:      the organizers' example (fused SwiGLU); kept because it saves memory,
-                           it does not count as our own kernel.
+- solution/cross_entropy.py: fused causal-LM cross-entropy over the 152k vocabulary, straight
+                           from the fp16 logits (no fp32 copies);
+- solution/mlp.py:         keeps the MLP's wide intermediates in fp16 (bit-identical, half the
+                           memory) around the organizers' example SwiGLU (solution/swiglu.py),
+                           which does not count as our own kernel.
 """
 
+from .cross_entropy import patch_causal_lm_loss
+from .mlp import patch_qwen2_mlp_low_precision
 from .nf4_dequant import patch_bnb_dequant
 from .rmsnorm import patch_qwen2_decoder_add_norm, patch_qwen2_rmsnorm
 from .rope import patch_qwen2_rope
-from .swiglu import patch_qwen2_mlp
 
 
 def apply():
@@ -23,7 +27,8 @@ def apply():
     patch_qwen2_rmsnorm()
     patch_qwen2_decoder_add_norm()
     patch_qwen2_rope()
-    patch_qwen2_mlp()  # the example: works out of the box, does not count as our own kernel
+    patch_causal_lm_loss()
+    patch_qwen2_mlp_low_precision()  # wraps the example's SwiGLU patch
 
     from . import diagnostics
 

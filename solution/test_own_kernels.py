@@ -255,3 +255,102 @@ def test_patched_qwen2_decoder_layer_matches_original():
          modeling_qwen2.apply_rotary_pos_emb) = saved
     for a, b in zip(ours, ref):
         torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-4)
+
+
+# ---------------------------------------------------------------- fused cross-entropy
+
+@pytest.mark.parametrize("with_num_items", [True, False])
+@pytest.mark.parametrize("vocab", [151936, 1000])
+def test_cross_entropy_matches_transformers(with_num_items, vocab):
+    from transformers.loss.loss_utils import ForCausalLMLoss
+
+    from solution.cross_entropy import causal_lm_loss
+
+    torch.manual_seed(0)
+    batch, tokens = 2, 100
+    logits = (3 * torch.randn(batch, tokens, vocab, device="cuda")).to(torch.float16)
+    labels = torch.randint(0, vocab, (batch, tokens), device="cuda")
+    labels[:, :30] = -100  # a prompt that is not trained on
+    labels[1, 80:] = -100  # padding
+    num_items = (labels[:, 1:] != -100).sum() if with_num_items else None
+
+    l1 = logits.clone().requires_grad_(True)
+    ref = ForCausalLMLoss(l1, labels, vocab, num_items_in_batch=num_items)
+    (ref * 1024.0).backward()  # like a GradScaler
+
+    l2 = logits.clone().requires_grad_(True)
+    ours = causal_lm_loss(l2, labels, vocab, num_items_in_batch=num_items)
+    (ours * 1024.0).backward()
+
+    assert ours.dtype == ref.dtype == torch.float32
+    torch.testing.assert_close(ours, ref, rtol=1e-5, atol=1e-5)
+    assert l2.grad.dtype == torch.float16
+    torch.testing.assert_close(l2.grad.float(), l1.grad.float(), rtol=2e-3, atol=2e-3)
+
+
+def test_loss_patch_is_used_by_qwen2():
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+    from transformers.loss import loss_utils
+
+    from solution.cross_entropy import patch_causal_lm_loss
+
+    torch.manual_seed(0)
+    config = Qwen2Config(hidden_size=64, intermediate_size=128, num_attention_heads=4,
+                         num_key_value_heads=2, num_hidden_layers=1, vocab_size=500)
+    model = Qwen2ForCausalLM(config).cuda()
+    ids = torch.randint(0, 500, (2, 20), device="cuda")
+    expected = model(input_ids=ids, labels=ids).loss
+    original = loss_utils.LOSS_MAPPING["ForCausalLM"]
+    patch_causal_lm_loss()
+    try:
+        assert getattr(model.loss_function, "is_soup_triton", False)
+        torch.testing.assert_close(model(input_ids=ids, labels=ids).loss, expected,
+                                   rtol=1e-5, atol=1e-5)
+    finally:
+        loss_utils.LOSS_MAPPING["ForCausalLM"] = original
+
+
+# ---------------------------------------------------------------- MLP with fp16 intermediates
+
+def test_low_precision_mlp_matches_fp32_mlp():
+    """Real bitsandbytes 4-bit MLP, fp32 input (as in the task): same output and gradients."""
+    import bitsandbytes as bnb
+    from transformers import Qwen2Config
+    from transformers.models.qwen2 import modeling_qwen2
+
+    from solution.mlp import patch_qwen2_mlp_low_precision
+
+    torch.manual_seed(0)
+    config = Qwen2Config(hidden_size=256, intermediate_size=768)
+    mlp = modeling_qwen2.Qwen2MLP(config)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        dense = getattr(mlp, name)
+        q = bnb.nn.Linear4bit(dense.in_features, dense.out_features, bias=False,
+                              compute_dtype=torch.float16, quant_type="nf4")
+        q.weight = bnb.nn.Params4bit(dense.weight.data.clone(), requires_grad=False,
+                                     quant_type="nf4")
+        setattr(mlp, name, q)
+    mlp = mlp.cuda()
+    x = torch.randn(2, 64, 256, device="cuda")
+    grad = torch.randn(2, 64, 256, device="cuda")
+
+    def run():
+        inp = x.clone().requires_grad_(True)
+        out = mlp(inp)
+        out.backward(grad)
+        return out.detach(), inp.grad
+
+    original = modeling_qwen2.Qwen2MLP.forward
+    try:
+        from solution.swiglu import patch_qwen2_mlp
+        patch_qwen2_mlp()
+        ref = run()  # the example's path: fp32 intermediates
+        modeling_qwen2.Qwen2MLP.forward = original
+        patch_qwen2_mlp_low_precision()
+        assert getattr(modeling_qwen2.Qwen2MLP.forward, "is_soup_lowp", False)
+        ours = run()
+    finally:
+        modeling_qwen2.Qwen2MLP.forward = original
+    assert ours[0].dtype == torch.float32
+    torch.testing.assert_close(ours[0], ref[0], rtol=1e-3, atol=1e-3)  # bit-identical expected
+    torch.testing.assert_close(ours[1], ref[1], rtol=1e-3, atol=1e-3)
