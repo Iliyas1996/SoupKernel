@@ -24,3 +24,8 @@ def apply():
     patch_qwen2_decoder_add_norm()
     patch_qwen2_rope()
     patch_qwen2_mlp()  # the example: works out of the box, does not count as our own kernel
+
+    from . import diagnostics
+
+    if diagnostics.enabled():  # only for our own analysis runs (SOUP_KERNEL_DIAG=1), never measured
+        diagnostics.enable()
