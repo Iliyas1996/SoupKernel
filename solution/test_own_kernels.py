@@ -354,3 +354,70 @@ def test_low_precision_mlp_matches_fp32_mlp():
     assert ours[0].dtype == torch.float32
     torch.testing.assert_close(ours[0], ref[0], rtol=1e-3, atol=1e-3)  # bit-identical expected
     torch.testing.assert_close(ours[1], ref[1], rtol=1e-3, atol=1e-3)
+
+
+# ---------------------------------------------------------------- metrics from fp16 logits
+
+def _logits_and_labels(vocab=151936):
+    torch.manual_seed(0)
+    logits = (3 * torch.randn(2, 120, vocab, device="cuda")).to(torch.float16)
+    labels = torch.randint(0, vocab, (2, 120), device="cuda")
+    labels[:, :40] = -100
+    labels[1, 90:] = -100
+    return logits, labels
+
+
+def test_entropy_from_fp16_logits_matches_trl_on_fp32():
+    from trl.trainer.utils import entropy_from_logits
+
+    from solution.logits_metrics import token_entropy
+
+    logits, _ = _logits_and_labels()
+    reference = entropy_from_logits(logits.float())  # what TRL computed before (fp32 copy)
+    ours = token_entropy(logits)
+    assert ours.shape == reference.shape and ours.dtype == torch.float32
+    torch.testing.assert_close(ours, reference, rtol=1e-4, atol=1e-4)
+
+
+def test_row_losses_from_fp16_logits_match_soup_on_fp32():
+    from soup_cli.trainer import rewind_hf
+
+    from solution.logits_metrics import patch_soup_row_losses
+
+    logits, labels = _logits_and_labels()
+    original = rewind_hf.row_losses
+    ref_loss, ref_tokens = original(logits.float(), labels)
+    patch_soup_row_losses()
+    try:
+        assert getattr(rewind_hf.row_losses, "is_soup_triton", False)
+        loss, tokens = rewind_hf.row_losses(logits, labels)
+    finally:
+        rewind_hf.row_losses = original
+    assert tokens == ref_tokens
+    for a, b in zip(loss, ref_loss):
+        assert abs(a - b) <= 1e-4 * max(1.0, abs(b))
+
+
+def test_accelerate_keeps_fp16_logits_and_converts_the_rest():
+    from accelerate.utils import operations
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+
+    from solution.logits_metrics import patch_keep_fp16_logits
+
+    logits = torch.randn(2, 5, 300, device="cuda", dtype=torch.float16)
+    hidden = torch.randn(2, 5, 8, device="cuda", dtype=torch.float16)
+    loss = torch.tensor(1.5, device="cuda")
+
+    def forward():
+        return CausalLMOutputWithPast(loss=loss, logits=logits, hidden_states=(hidden,))
+
+    original = operations.ConvertOutputsToFp32.__call__
+    patch_keep_fp16_logits()
+    try:
+        out = operations.ConvertOutputsToFp32(forward)()
+    finally:
+        operations.ConvertOutputsToFp32.__call__ = original
+    assert isinstance(out, CausalLMOutputWithPast)
+    assert list(out.keys()) == ["loss", "logits", "hidden_states"]
+    assert out.logits is logits and out["logits"] is logits
+    assert out.hidden_states[0].dtype == torch.float32 and out.loss is loss

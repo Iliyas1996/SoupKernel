@@ -10,12 +10,16 @@ that run our own Triton kernels:
 - solution/rope.py:        fused rotary position embedding for the queries and keys;
 - solution/cross_entropy.py: fused causal-LM cross-entropy over the 152k vocabulary, straight
                            from the fp16 logits (no fp32 copies);
+- solution/logits_metrics.py: TRL's entropy and Soup's per-row loss computed in fp32 by our kernel
+                           straight from the fp16 logits, so the logits are not copied to fp32
+                           just for logging;
 - solution/mlp.py:         keeps the MLP's wide intermediates in fp16 (bit-identical, half the
                            memory) around the organizers' example SwiGLU (solution/swiglu.py),
                            which does not count as our own kernel.
 """
 
 from .cross_entropy import patch_causal_lm_loss
+from .logits_metrics import patch_logits_metrics
 from .mlp import patch_qwen2_mlp_low_precision
 from .nf4_dequant import patch_bnb_dequant
 from .rmsnorm import patch_qwen2_decoder_add_norm, patch_qwen2_rmsnorm
@@ -28,6 +32,7 @@ def apply():
     patch_qwen2_decoder_add_norm()
     patch_qwen2_rope()
     patch_causal_lm_loss()
+    patch_logits_metrics()
     patch_qwen2_mlp_low_precision()  # wraps the example's SwiGLU patch
 
     from . import diagnostics
