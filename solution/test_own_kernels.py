@@ -136,3 +136,122 @@ def test_patch_routes_qwen2_rmsnorm_through_triton():
         torch.testing.assert_close(norm(x), expected, rtol=1e-4, atol=1e-4)
     finally:
         modeling_qwen2.Qwen2RMSNorm.forward = original
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_add_rmsnorm_matches_add_then_norm(dtype):
+    from solution.rmsnorm import add_rmsnorm
+
+    torch.manual_seed(0)
+    eps = 1e-6
+    shape = (4, 300, 1536)
+    residual = torch.randn(shape, device="cuda", dtype=dtype)
+    delta = torch.randn(shape, device="cuda", dtype=dtype)
+    weight = 1 + 0.1 * torch.randn(1536, device="cuda")
+    g_h = torch.randn(shape, device="cuda").to(dtype)
+    g_out = torch.randn(shape, device="cuda")
+
+    r1, d1 = residual.clone().requires_grad_(True), delta.clone().requires_grad_(True)
+    h_ref = r1 + d1
+    out_ref = reference_rmsnorm(h_ref, weight, eps)
+    (h_ref * g_h).sum().backward(retain_graph=True)
+    out_ref.backward(g_out)
+
+    r2, d2 = residual.clone().requires_grad_(True), delta.clone().requires_grad_(True)
+    h, out = add_rmsnorm(r2, d2, weight, eps)
+    (h * g_h).sum().backward(retain_graph=True)
+    out.backward(g_out)
+
+    tol = TOL[dtype]
+    assert torch.equal(h, h_ref)  # the residual itself is bit-exact
+    torch.testing.assert_close(out, out_ref, rtol=tol, atol=tol)
+    torch.testing.assert_close(r2.grad.float(), r1.grad.float(), rtol=tol, atol=tol)
+    torch.testing.assert_close(d2.grad.float(), d1.grad.float(), rtol=tol, atol=tol)
+
+
+# ---------------------------------------------------------------- RoPE
+
+def reference_rope(q, cos, sin):
+    """transformers' apply_rotary_pos_emb for one tensor."""
+    cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+    half = q.shape[-1] // 2
+    rotated = torch.cat((-q[..., half:], q[..., :half]), dim=-1)
+    return (q * cos) + (rotated * sin)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("heads,tokens,batch_cos", [(12, 300, 4), (2, 300, 1), (12, 7, 1)])
+def test_rope_matches_transformers(dtype, heads, tokens, batch_cos):
+    from solution.rope import TritonRoPE
+
+    torch.manual_seed(0)
+    batch, dim = 4, 128
+    # q as transformers makes it: (batch, tokens, heads, dim) viewed as (batch, heads, tokens, dim)
+    q = torch.randn(batch, tokens, heads, dim, device="cuda", dtype=dtype).transpose(1, 2)
+    angles = torch.rand(batch_cos, tokens, dim // 2, device="cuda") * 50
+    emb = torch.cat((angles, angles), dim=-1)
+    cos, sin = emb.cos().to(dtype), emb.sin().to(dtype)
+    grad = torch.randn(batch, heads, tokens, dim, device="cuda").to(dtype)
+
+    q1 = q.detach().clone().requires_grad_(True)
+    ref = reference_rope(q1, cos, sin)
+    ref.backward(grad)
+
+    q2 = q.detach().clone().requires_grad_(True)
+    cos_b = cos.expand(batch, -1, -1) if batch_cos == 1 else cos
+    sin_b = sin.expand(batch, -1, -1) if batch_cos == 1 else sin
+    out = TritonRoPE.apply(q2, cos_b, sin_b)
+    out.backward(grad)
+
+    # PyTorch rounds fp16 after each of the three ops; the kernel rounds once at the end
+    tol = 1e-5 if dtype == torch.float32 else 5e-3
+    assert out.dtype == ref.dtype
+    torch.testing.assert_close(out, ref, rtol=tol, atol=tol)
+    torch.testing.assert_close(q2.grad, q1.grad, rtol=tol, atol=tol)
+
+
+# ---------------------------------------------------------------- a whole Qwen2 decoder layer
+
+def test_patched_qwen2_decoder_layer_matches_original():
+    """RMSNorm, add+RMSNorm and RoPE patches together, on a small random Qwen2 layer."""
+    from transformers import Qwen2Config
+    from transformers.models.qwen2 import modeling_qwen2
+
+    from solution.rmsnorm import patch_qwen2_decoder_add_norm, patch_qwen2_rmsnorm
+    from solution.rope import patch_qwen2_rope
+
+    torch.manual_seed(0)
+    config = Qwen2Config(hidden_size=256, intermediate_size=512, num_attention_heads=4,
+                         num_key_value_heads=2, num_hidden_layers=1, vocab_size=100)
+    config._attn_implementation = "sdpa"
+    layer = modeling_qwen2.Qwen2DecoderLayer(config, layer_idx=0).cuda()
+    with torch.no_grad():
+        for norm in (layer.input_layernorm, layer.post_attention_layernorm):
+            norm.weight.add_(0.1 * torch.randn_like(norm.weight))
+    rotary = modeling_qwen2.Qwen2RotaryEmbedding(config=config).cuda()
+    x = torch.randn(2, 33, 256, device="cuda")
+    position_ids = torch.arange(33, device="cuda")[None]
+    grad = torch.randn(2, 33, 256, device="cuda")
+
+    def run():
+        layer.zero_grad()
+        inp = x.clone().requires_grad_(True)
+        position_embeddings = rotary(inp, position_ids)
+        out = layer(inp, position_ids=position_ids, position_embeddings=position_embeddings)
+        out.backward(grad)
+        return out.detach(), inp.grad, layer.self_attn.q_proj.weight.grad.clone()
+
+    saved = (modeling_qwen2.Qwen2RMSNorm.forward, modeling_qwen2.Qwen2DecoderLayer.forward,
+             modeling_qwen2.apply_rotary_pos_emb)
+    ref = run()
+    patch_qwen2_rmsnorm()
+    patch_qwen2_decoder_add_norm()
+    patch_qwen2_rope()
+    try:
+        assert getattr(modeling_qwen2.Qwen2DecoderLayer.forward, "is_soup_triton", False)
+        ours = run()
+    finally:
+        (modeling_qwen2.Qwen2RMSNorm.forward, modeling_qwen2.Qwen2DecoderLayer.forward,
+         modeling_qwen2.apply_rotary_pos_emb) = saved
+    for a, b in zip(ours, ref):
+        torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-4)
